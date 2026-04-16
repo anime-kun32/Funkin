@@ -1,0 +1,146 @@
+name: Compile FNF Multi-Platform
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+
+jobs:
+  build-html5:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build-flags:
+          - ""
+          - "-DGITHUB_BUILD"
+          - "-DFEATURE_POLYMOD_MODS"
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: 'recursive'
+        fetch-depth: 0
+    
+    - name: Setup Haxe
+      uses: krdlab/setup-haxe@v1
+      with:
+        haxe-version: 4.3.1
+    
+    - name: Cache Haxelib dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/haxelib
+        key: ${{ runner.os }}-haxelib-${{ hashFiles('hmm.json') }}
+        restore-keys: |
+          ${{ runner.os }}-haxelib-
+    
+    - name: Install dependencies
+      run: |
+        haxelib --global install hmm
+        haxelib --global run hmm setup
+        haxelib --global git haxelib https://github.com/FunkinCrew/haxelib.git
+        haxelib --global git hmm https://github.com/FunkinCrew/hmm.git
+        hmm install
+    
+    - name: Setup Lime
+      run: |
+        haxelib run lime setup
+        haxelib run lime rebuild html5
+    
+    - name: Build HTML5 (${{ matrix.build-flags || 'default' }})
+      run: |
+        mkdir -p build_output
+        FLAGS="${{ matrix.build-flags }}"
+        if [ "${{ github.event.inputs.build_type }}" = "debug" ]; then
+          FLAGS="$FLAGS -debug"
+        fi
+        haxelib run lime build html5 $FLAGS
+      env:
+        HAXE_STD_PATH: /opt/haxe/${{ env.HAXE_VERSION }}/std
+    
+    - name: Prepare artifact
+      run: |
+        # Find the actual build directory (usually export/html5/bin or similar)
+        if [ -d "export/html5/bin" ]; then
+          BUILD_DIR="export/html5/bin"
+        elif [ -d "export/html5" ]; then
+          BUILD_DIR="export/html5"
+        else
+          echo "::error::Could not find build directory"
+          exit 1
+        fi
+        
+        # Create a zip of the build
+        cd $BUILD_DIR
+        zip -r ../../../fnf-html5-${{ matrix.build-flags == '' && 'default' || hashFiles(format('{0}', matrix.build-flags)) }}.zip .
+        cd ../../..
+    
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: fnf-html5-${{ matrix.build-flags == '' && 'standard' || 'github-build' }}
+        path: fnf-html5-*.zip
+        retention-days: 7
+    
+    - name: Upload raw build files
+      uses: actions/upload-artifact@v4
+      with:
+        name: fnf-html5-files-${{ matrix.build-flags == '' && 'standard' || 'github-build' }}
+        path: export/**/html5/bin/**
+        retention-days: 7
+
+  # Optional: Test the HTML5 build
+  test-html5:
+    runs-on: ubuntu-latest
+    needs: build-html5
+    if: always()
+    
+    steps:
+    - name: Download artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: fnf-html5-files-standard
+        path: test-build
+    
+    - name: Test with simple HTTP server
+      run: |
+        cd test-build
+        # Check if index.html exists
+        if [ -f "index.html" ]; then
+          echo "✅ index.html found"
+        else
+          echo "❌ index.html not found!"
+          exit 1
+        fi
+        
+        # Check for required files
+        for file in index.html *.js *.wasm; do
+          if ls $file 2>/dev/null | head -n 1; then
+            echo "✅ $file exists"
+          fi
+        done
+        
+        # Start a simple server and test
+        python3 -m http.server 8080 &
+        SERVER_PID=$!
+        sleep 5
+        
+        # Test if server is responding
+        if curl -s http://localhost:8080/ | grep -q "html"; then
+          echo "✅ Server serving files correctly"
+        else
+          echo "❌ Server test failed"
+        fi
+        
+        kill $SERVER_PID
